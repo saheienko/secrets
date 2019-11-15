@@ -102,8 +102,10 @@ func (v *vaultSecrets) String() string {
 
 func (v *vaultSecrets) keyPath(secretID, namespace string) string {
 	if v.isKvBackendV2 {
+		fmt.Printf("key path: isKV2=%t ns=%s backend=%s kvKey=%s secret=%s\n", v.isKvBackendV2, namespace, v.backendPath, kvDataKey, secretID)
 		return path.Join(namespace, v.backendPath, kvDataKey, secretID)
 	}
+	fmt.Printf("key path: ns=%s backend=%s secret=%s\n", v.backendPath, namespace, secretID)
 	return path.Join(namespace, v.backendPath, secretID)
 }
 
