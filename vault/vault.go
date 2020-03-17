@@ -29,11 +29,16 @@ const (
 	kvVersion2          = "kv-v2"
 
 	AuthMethodKubernetes = "kubernetes"
+	AuthMethodAppRole    = "approle"
 
 	AuthMethod              = "VAULT_AUTH_METHOD"
 	AuthMountPath           = "VAULT_AUTH_MOUNT_PATH"
 	AuthKubernetesRole      = "VAULT_AUTH_KUBERNETES_ROLE"
 	AuthKubernetesTokenPath = "VAULT_AUTH_KUBERNETES_TOKEN_PATH"
+	AuthApproleRoleID       = "VAULT_AUTH_APPROLE_ROLE_ID"
+	AuthApproleSecretID     = "VAULT_AUTH_APPROLE_SECRET_ID"
+
+	AuthKubernetesMountPath = "auth/kubernetes"
 )
 
 var (
@@ -44,7 +49,9 @@ var (
 	ErrInvalidVaultAddress = errors.New("VAULT_ADDRESS is invalid. " +
 		"Should be of the form http(s)://<ip>:<port>")
 
-	ErrVaultAuthKubernetesRole = fmt.Errorf("%s not set", AuthKubernetesRole)
+	ErrAuthMethodUnknown = fmt.Errorf("unknown auth method")
+	ErrKubernetesRole    = fmt.Errorf("%s not set", AuthKubernetesRole)
+	ErrApproleRoleID     = fmt.Errorf("%s not set", AuthApproleRoleID)
 )
 
 type vaultSecrets struct {
@@ -54,7 +61,7 @@ type vaultSecrets struct {
 	endpoint      string
 	backendPath   string
 	isKvBackendV2 bool
-	autAuth       bool
+	autoAuth      bool
 	config        map[string]interface{}
 }
 
@@ -94,21 +101,21 @@ func New(
 	}
 
 	var autoAuth bool
-	if getVaultParam(secretConfig, AuthMethod) == AuthMethodKubernetes {
-		token, err := kubernetesAuth(client, secretConfig)
+	var token string
+	if getVaultParam(secretConfig, AuthMethod) != "" {
+		token, err = getAuthToken(client, secretConfig)
 		if err != nil {
 			return nil, err
 		}
 
 		autoAuth = true
-		client.SetToken(token)
 	} else {
-		token := getVaultParam(secretConfig, api.EnvVaultToken)
-		if token == "" {
-			return nil, ErrVaultTokenNotSet
-		}
-		client.SetToken(token)
+		token = getVaultParam(secretConfig, api.EnvVaultToken)
 	}
+	if token == "" {
+		return nil, ErrVaultTokenNotSet
+	}
+	client.SetToken(token)
 
 	backendPath := getVaultParam(secretConfig, VaultBackendPathKey)
 	if backendPath == "" {
@@ -132,7 +139,7 @@ func New(
 		client:        client,
 		backendPath:   backendPath,
 		isKvBackendV2: isBackendV2,
-		autAuth:       autoAuth,
+		autoAuth:      autoAuth,
 		config:        secretConfig,
 	}, nil
 }
@@ -228,7 +235,8 @@ func (v *vaultSecrets) ListSecrets() ([]string, error) {
 func (v *vaultSecrets) read(path string) (*api.Secret, error) {
 	secretValue, err := v.lockedRead(path)
 	if v.isTokeExpired(err) {
-		if err = v.renewToken(); err != nil {
+		if renewErr := v.renewToken(); renewErr != nil {
+			// return the 'read' error
 			return nil, err
 		}
 		return v.lockedRead(path)
@@ -237,9 +245,7 @@ func (v *vaultSecrets) read(path string) (*api.Secret, error) {
 }
 
 func (v *vaultSecrets) write(path string, data map[string]interface{}) (*api.Secret, error) {
-	v.mu.RLock()
 	secretValue, err := v.lockedWrite(path, data)
-	v.mu.RUnlock()
 	if v.isTokeExpired(err) {
 		if err = v.renewToken(); err != nil {
 			return nil, err
@@ -285,7 +291,7 @@ func (v *vaultSecrets) renewToken() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	token, err := kubernetesAuth(v.client, v.config)
+	token, err := getAuthToken(v.client, v.config)
 	if err != nil {
 		return fmt.Errorf("renew token: %s", err)
 	}
@@ -295,7 +301,7 @@ func (v *vaultSecrets) renewToken() error {
 }
 
 func (v *vaultSecrets) isTokeExpired(err error) bool {
-	return err != nil && v.autAuth && strings.Contains(err.Error(), "permission denied")
+	return err != nil && v.autoAuth && strings.Contains(err.Error(), "permission denied")
 }
 
 func isKvBackendV2(client *api.Client, backendPath string) (bool, error) {
@@ -359,17 +365,8 @@ func configureTLS(config *api.Config, secretConfig map[string]interface{}) error
 	return config.ConfigureTLS(&tlsConfig)
 }
 
-func kubernetesAuth(client *api.Client, config map[string]interface{}) (string, error) {
-	authConfig, err := buildAuthConfig(config)
-	if err != nil {
-		return "", err
-	}
-	method, err := kubernetes.NewKubernetesAuthMethod(authConfig)
-	if err != nil {
-		return "", err
-	}
-
-	path, data, err := method.Authenticate(context.TODO(), client)
+func getAuthToken(client *api.Client, config map[string]interface{}) (string, error) {
+	path, data, err := authenticate(client, config)
 	if err != nil {
 		return "", err
 	}
@@ -388,14 +385,53 @@ func kubernetesAuth(client *api.Client, config map[string]interface{}) (string, 
 	return secret.Auth.ClientToken, err
 }
 
-func buildAuthConfig(config map[string]interface{}) (*auth.AuthConfig, error) {
-	role := getVaultParam(config, AuthKubernetesRole)
-	if role == "" {
-		return nil, ErrVaultAuthKubernetesRole
+func authenticate(client *api.Client, config map[string]interface{}) (string, map[string]interface{}, error) {
+	method := getVaultParam(config, AuthMethod)
+	switch method {
+	case AuthMethodKubernetes:
+		return authKubernetes(client, config)
+	case AuthMethodAppRole:
+		return authAppRole(client, config)
+	}
+	return "", nil, fmt.Errorf("%s method: %s", method, ErrAuthMethodUnknown)
+}
+
+func authKubernetes(client *api.Client, config map[string]interface{}) (string, map[string]interface{}, error) {
+	authConfig, err := buildAuthConfig(config)
+	if err != nil {
+		return "", nil, err
+	}
+	method, err := kubernetes.NewKubernetesAuthMethod(authConfig)
+	if err != nil {
+		return "", nil, err
+	}
+
+	return method.Authenticate(context.TODO(), client)
+}
+
+func authAppRole(client *api.Client, config map[string]interface{}) (string, map[string]interface{}, error) {
+	roleID := getVaultParam(config, AuthApproleRoleID)
+	if roleID == "" {
+		return "", nil, ErrApproleRoleID
 	}
 	mountPath := getVaultParam(config, AuthMountPath)
 	if mountPath == "" {
-		mountPath = "auth/kubernetes"
+		mountPath = "auth/approle"
+	}
+	return fmt.Sprintf("%s/login", mountPath), map[string]interface{}{
+		"role_id":   roleID,
+		"secret_id": getVaultParam(config, AuthApproleSecretID),
+	}, nil
+}
+
+func buildAuthConfig(config map[string]interface{}) (*auth.AuthConfig, error) {
+	role := getVaultParam(config, AuthKubernetesRole)
+	if role == "" {
+		return nil, ErrKubernetesRole
+	}
+	mountPath := getVaultParam(config, AuthMountPath)
+	if mountPath == "" {
+		mountPath = AuthKubernetesMountPath
 	}
 	tokenPath := getVaultParam(config, AuthKubernetesTokenPath)
 
