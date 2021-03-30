@@ -16,6 +16,7 @@ import (
 	"github.com/hashicorp/vault/command/agent/auth"
 	"github.com/hashicorp/vault/command/agent/auth/kubernetes"
 	"github.com/libopenstorage/secrets"
+	"github.com/libopenstorage/secrets/vault/secretengine"
 )
 
 const (
@@ -36,7 +37,7 @@ const (
 	AuthMethod = "VAULT_AUTH_METHOD"
 	// AuthMountPath defines a custom auth mount path.
 	AuthMountPath = "VAULT_AUTH_MOUNT_PATH"
-	// AuthKubernetesRole is the role to authenticate against on Vault
+	// AuthKubernetesRole is the role to authenticate against on Vault.
 	AuthKubernetesRole = "VAULT_AUTH_KUBERNETES_ROLE"
 	// AuthKubernetesTokenPath is the file path to a custom JWT token to use for authentication.
 	// If omitted, the default service account token path is used.
@@ -44,6 +45,10 @@ const (
 
 	// AuthKubernetesMountPath
 	AuthKubernetesMountPath = "kubernetes"
+
+	SecretEngineKV      = "kv"
+	SecretEngineKV2     = "kv-v2"
+	SecretEngineTransit = "transit"
 )
 
 var (
@@ -58,12 +63,18 @@ var (
 	ErrKubernetesRole    = fmt.Errorf("%s not set", AuthKubernetesRole)
 )
 
+func init() {
+	if err := secrets.Register(Name, New); err != nil {
+		panic(err.Error())
+	}
+}
+
 type vaultSecrets struct {
 	mu     sync.RWMutex
 	client *api.Client
 
-	currentNamespace string
 	lockClientToken  sync.Mutex
+	currentNamespace string
 
 	endpoint      string
 	backendPath   string
@@ -71,6 +82,7 @@ type vaultSecrets struct {
 	isKvBackendV2 bool
 	autoAuth      bool
 	config        map[string]interface{}
+	secretEngine  secretengine.SecretEngine
 }
 
 // These variables are helpful in testing to stub method call from packages
@@ -163,6 +175,7 @@ func New(
 		isKvBackendV2:    isBackendV2,
 		autoAuth:         autoAuth,
 		config:           secretConfig,
+		secretEngine:     secretengine.NewSecretEngine(client),
 	}, nil
 }
 
@@ -170,41 +183,29 @@ func (v *vaultSecrets) String() string {
 	return Name
 }
 
-func (v *vaultSecrets) keyPath(secretID, namespace string) keyPath {
-	if namespace == "" {
-		namespace = v.namespace
-	}
-	return keyPath{
-		backendPath: v.backendPath,
-		isBackendV2: v.isKvBackendV2,
-		namespace:   namespace,
-		secretID:    secretID,
-	}
-}
-
 func (v *vaultSecrets) GetSecret(
 	secretID string,
 	keyContext map[string]string,
 ) (map[string]interface{}, error) {
-	key := v.keyPath(secretID, keyContext[secrets.KeyVaultNamespace])
-	secretValue, err := v.read(key)
+	key := v.keyPath(secretID, keyContext)
+	secretData, err := v.getSecret(key, keyContext)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get secret: %s: %s", key, err)
 	}
-	if secretValue == nil {
+	if secretData == nil {
 		return nil, secrets.ErrInvalidSecretId
 	}
 
 	if v.isKvBackendV2 {
-		if data, exists := secretValue.Data[kvDataKey]; exists && data != nil {
+		if data, exists := secretData[kvDataKey]; exists && data != nil {
 			if data, ok := data.(map[string]interface{}); ok {
 				return data, nil
 			}
 		}
 		return nil, secrets.ErrInvalidSecretId
-	} else {
-		return secretValue.Data, nil
 	}
+
+	return secretData, nil
 }
 
 func (v *vaultSecrets) PutSecret(
@@ -218,8 +219,8 @@ func (v *vaultSecrets) PutSecret(
 		}
 	}
 
-	key := v.keyPath(secretID, keyContext[secrets.KeyVaultNamespace])
-	if _, err := v.write(key, secretData); err != nil {
+	key := v.keyPath(secretID, keyContext)
+	if err := v.write(key, secretData, keyContext); err != nil {
 		return fmt.Errorf("failed to put secret: %s: %s", key, err)
 	}
 	return nil
@@ -229,8 +230,8 @@ func (v *vaultSecrets) DeleteSecret(
 	secretID string,
 	keyContext map[string]string,
 ) error {
-	key := v.keyPath(secretID, keyContext[secrets.KeyVaultNamespace])
-	if _, err := v.delete(key); err != nil {
+	key := v.keyPath(secretID, keyContext)
+	if err := v.delete(key, keyContext); err != nil {
 		return fmt.Errorf("failed to delete secret: %s: %s", key, err)
 	}
 	return nil
@@ -266,85 +267,96 @@ func (v *vaultSecrets) ListSecrets() ([]string, error) {
 	return nil, secrets.ErrNotSupported
 }
 
-func (v *vaultSecrets) read(path keyPath) (*api.Secret, error) {
+func (v *vaultSecrets) keyPath(secretID string, keyContext map[string]string) secretengine.SecretKey {
+	namespace := v.namespace
+	if keyContext != nil && len(keyContext[secrets.KeyVaultNamespace]) > 0 {
+		namespace = keyContext[secrets.KeyVaultNamespace]
+	}
+	return secretengine.SecretKey{
+		Name:      secretID,
+		Namespace: namespace,
+	}
+}
+
+func (v *vaultSecrets) getSecret(key secretengine.SecretKey, keyContext map[string]string) (map[string]interface{}, error) {
 	if v.autoAuth {
 		v.lockClientToken.Lock()
 		defer v.lockClientToken.Unlock()
 
-		if err := v.setNamespaceToken(path.Namespace()); err != nil {
+		if err := v.setNamespaceToken(key.Namespace); err != nil {
 			return nil, err
 		}
 	}
 
-	secretValue, err := v.lockedRead(path.Path())
+	secretValue, err := v.lockedGetSecret(key, keyContext)
 	if v.isTokenExpired(err) {
-		if err = v.renewToken(path.Namespace()); err != nil {
+		if err = v.renewToken(key.Namespace); err != nil {
 			return nil, fmt.Errorf("failed to renew token: %s", err)
 		}
-		return v.lockedRead(path.Path())
+		return v.lockedGetSecret(key, keyContext)
 	}
 	return secretValue, err
 }
 
-func (v *vaultSecrets) write(path keyPath, data map[string]interface{}) (*api.Secret, error) {
+func (v *vaultSecrets) write(key secretengine.SecretKey, data map[string]interface{}, keyContext map[string]string) error {
 	if v.autoAuth {
 		v.lockClientToken.Lock()
 		defer v.lockClientToken.Unlock()
 
-		if err := v.setNamespaceToken(path.Namespace()); err != nil {
-			return nil, err
+		if err := v.setNamespaceToken(key.Namespace); err != nil {
+			return err
 		}
 	}
 
-	secretValue, err := v.lockedWrite(path.Path(), data)
+	err := v.lockedPutSecret(key, data, keyContext)
 	if v.isTokenExpired(err) {
-		if err = v.renewToken(path.Namespace()); err != nil {
-			return nil, fmt.Errorf("failed to renew token: %s", err)
+		if err = v.renewToken(key.Namespace); err != nil {
+			return fmt.Errorf("failed to renew token: %s", err)
 		}
-		return v.lockedWrite(path.Path(), data)
+		return v.lockedPutSecret(key, data, keyContext)
 	}
-	return secretValue, err
+	return err
 }
 
-func (v *vaultSecrets) delete(path keyPath) (*api.Secret, error) {
+func (v *vaultSecrets) delete(key secretengine.SecretKey, keyContext map[string]string) error {
 	if v.autoAuth {
 		v.lockClientToken.Lock()
 		defer v.lockClientToken.Unlock()
 
-		if err := v.setNamespaceToken(path.Namespace()); err != nil {
-			return nil, err
+		if err := v.setNamespaceToken(key.Namespace); err != nil {
+			return err
 		}
 	}
 
-	secretValue, err := v.lockedDelete(path.Path())
+	err := v.lockedDeleteSecret(key, keyContext)
 	if v.isTokenExpired(err) {
-		if err = v.renewToken(path.Namespace()); err != nil {
-			return nil, fmt.Errorf("failed to renew token: %s", err)
+		if err = v.renewToken(key.Namespace); err != nil {
+			return fmt.Errorf("failed to renew token: %s", err)
 		}
-		return v.lockedDelete(path.Path())
+		return v.lockedDeleteSecret(key, keyContext)
 	}
-	return secretValue, err
+	return err
 }
 
-func (v *vaultSecrets) lockedRead(path string) (*api.Secret, error) {
+func (v *vaultSecrets) lockedGetSecret(key secretengine.SecretKey, keyContext map[string]string) (map[string]interface{}, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
-	return v.client.Logical().Read(path)
+	return v.secretEngine.GetSecret(key, keyContext)
 }
 
-func (v *vaultSecrets) lockedWrite(path string, data map[string]interface{}) (*api.Secret, error) {
+func (v *vaultSecrets) lockedPutSecret(key secretengine.SecretKey, data map[string]interface{}, keyContext map[string]string) error {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
-	return v.client.Logical().Write(path, data)
+	return v.secretEngine.PutSecret(key, data, keyContext)
 }
 
-func (v *vaultSecrets) lockedDelete(path string) (*api.Secret, error) {
+func (v *vaultSecrets) lockedDeleteSecret(key secretengine.SecretKey, keyContext map[string]string) error {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
-	return v.client.Logical().Delete(path)
+	return v.secretEngine.DeleteSecret(key, keyContext)
 }
 
 func (v *vaultSecrets) renewToken(namespace string) error {
@@ -512,24 +524,11 @@ func trimSlash(in string) string {
 	return strings.Trim(in, "/")
 }
 
-func init() {
-	if err := secrets.Register(Name, New); err != nil {
-		panic(err.Error())
-	}
-}
-
 type keyPath struct {
 	backendPath string
 	isBackendV2 bool
 	namespace   string
 	secretID    string
-}
-
-func (k keyPath) Path() string {
-	if k.isBackendV2 {
-		return path.Join(k.namespace, k.backendPath, kvDataKey, k.secretID)
-	}
-	return path.Join(k.namespace, k.backendPath, k.secretID)
 }
 
 func (k keyPath) Namespace() string {
@@ -538,6 +537,13 @@ func (k keyPath) Namespace() string {
 
 func (k keyPath) String() string {
 	return fmt.Sprintf("backendPath=%s, backendV2=%t, namespace=%s, secretID=%s", k.backendPath, k.isBackendV2, k.namespace, k.secretID)
+}
+
+func (k keyPath) Path() string {
+	if k.isBackendV2 {
+		return path.Join(k.namespace, k.backendPath, kvDataKey, k.secretID)
+	}
+	return path.Join(k.namespace, k.backendPath, k.secretID)
 }
 
 func closeIdleConnections(cfg *api.Config) {

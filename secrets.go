@@ -40,15 +40,16 @@ const (
 )
 
 const (
-	TypeAWS    = "aws-kms"
-	TypeAzure  = "azure-kv"
-	TypeDCOS   = "dcos"
-	TypeDocker = "docker"
-	TypeGCloud = "gcloud-kms"
-	TypeIBM    = "ibm-kp"
-	TypeK8s    = "k8s"
-	TypeKVDB   = "kvdb"
-	TypeVault  = "vault"
+	TypeAWS          = "aws-kms"
+	TypeAzure        = "azure-kv"
+	TypeDCOS         = "dcos"
+	TypeDocker       = "docker"
+	TypeGCloud       = "gcloud-kms"
+	TypeIBM          = "ibm-kp"
+	TypeK8s          = "k8s"
+	TypeKVDB         = "kvdb"
+	TypeVault        = "vault"
+	TypeVaultTransit = "vaulttransit"
 )
 
 const (

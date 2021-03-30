@@ -7,7 +7,6 @@ import (
 
 	"github.com/hashicorp/vault/api"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func setup() {
@@ -190,35 +189,4 @@ func TestNew(t *testing.T) {
 	assert.NotNil(t, client)
 
 	isKvV2 = oldIsKvV2
-}
-
-func TestKeyPath(t *testing.T) {
-	testCases := []struct {
-		id          string
-		backendPath string
-		namespace   string
-		isKV2       bool
-		expected    string
-	}{
-		{},
-		{"id", "", "", false, "id"},
-		{"id", "secrets", "", false, "secrets/id"},
-		{"id/", "secrets/", "", false, "secrets/id"},
-		{"id/", "secrets/", "ns1", false, "ns1/secrets/id"},
-		{"id/", "secrets/", "ns1/ns2/", false, "ns1/ns2/secrets/id"},
-		{"path/to/key/id/", "secrets/", "ns1/ns2/", false, "ns1/ns2/secrets/path/to/key/id"},
-		{"id", "", "", true, "data/id"},
-		{"id", "kv", "", true, "kv/data/id"},
-		{"id", "kv", "ns1", true, "ns1/kv/data/id"},
-	}
-
-	for i, tc := range testCases {
-		v := &vaultSecrets{
-			backendPath:   tc.backendPath,
-			isKvBackendV2: tc.isKV2,
-		}
-
-		spath := v.keyPath(tc.id, tc.namespace)
-		require.Equalf(t, tc.expected, spath.Path(), "TC#%d", i)
-	}
 }
